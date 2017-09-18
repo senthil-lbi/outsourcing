@@ -8,6 +8,7 @@ import java.util.Calendar;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
@@ -34,11 +35,13 @@ import com.chargebee.models.Customer;
 import com.chargebee.models.Customer.CustomerListRequest;
 import com.chargebee.models.Invoice;
 import com.chargebee.models.Order;
+import com.chargebee.models.Order.Status;
 import com.chargebee.models.Subscription;
 import com.chargebee.models.Subscription.SubscriptionListRequest;
 import com.chargebee.models.Invoice.BillingAddress;
 import com.chargebee.models.Invoice.Discount;
 import com.chargebee.models.Invoice.InvoiceListRequest;
+import com.chargebee.models.Invoice.IssuedCreditNote;
 import com.chargebee.models.Invoice.LineItem;
 import com.chargebee.models.Invoice.ShippingAddress;
 import com.chargebee.models.enums.BillingPeriodUnit;
@@ -58,29 +61,32 @@ public class CBSSIntegration
 
 	public static void main(String[] args) throws Exception
 	{
-		logger.log(Level.INFO, "\n\n\n\n\n");
+		logger.log(Level.INFO, "\n\tMethod : Main");
 		CBSSIntegration integ = new CBSSIntegration(CBSSIConstants.cbKey, CBSSIConstants.cbName,
 				CBSSIConstants.ssKey);
 		integ.initSync();
 		logger.log(Level.INFO, "\n\tInitial Fetch Finished");
-		Thread.sleep(300000);
+		Thread.sleep(240000);
 		integ.sync();
 	}
 
 	private String getCBTimeZone(Date date)
 	{
+		logger.log(Level.INFO, "\n\tMethod : getCBTimeZone");
 		formatter.setTimeZone(TimeZone.getTimeZone("Europe/London"));
 		return formatter.format(date);
 	}
 
 	private String getSSTimeZone(Date date)
 	{
+		logger.log(Level.INFO, "\n\tMethod : getSSTimeZone");
 		formatter.setTimeZone(TimeZone.getTimeZone("America/Los_Angeles"));
 		return formatter.format(date);
 	}
 
 	public CBSSIntegration(String cbApiKey, String cbSite, String ssApiKey) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : CBSSIntegration Constructor");
 		this.cbApiKey = cbApiKey;
 		this.cbSite = cbSite;
 		this.ssApiKey = ssApiKey;
@@ -110,7 +116,7 @@ public class CBSSIntegration
 
 	private String getSSCurrencyCode() throws Exception
 	{
-
+		logger.log(Level.INFO, "\n\tMethod : getSSCurrencyCode");
 		Client client = ClientBuilder.newClient();
 		Response response = client.target(CBSSIConstants.ssWareHousesUrl).request(MediaType.TEXT_PLAIN_TYPE).header("Authorization", ssApiKey).get();
 		if (response.getStatus() == HttpStatus.SC_OK)
@@ -134,13 +140,14 @@ public class CBSSIntegration
 
 	public void initSync() throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : initSync");
 		logger.log(Level.INFO, "\n\tStarting Initial Sync.");
-
 		processSync(CBSSIConstants.INIT_FETCH);
 	}
 
 	private void processSync(int mode) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : processSync");
 		int count = 0;
 		Response response;
 		JSONObject ssOrder;
@@ -150,32 +157,40 @@ public class CBSSIntegration
 		String invoiceId;
 		String subscrpId;
 		String customerId;
+		InvoiceListRequest request;
 		Environment.configure(cbSite, cbApiKey);
 		JSONArray ssAllOrders = new JSONArray();
 		JSONObject orderVsInvoice = new JSONObject();
 		long lastSyncTime = System.currentTimeMillis();
-		HashMap<String, Customer> updCustomers = new HashMap<String, Customer>();
-		HashMap<String, Subscription> updSubscriptions = new HashMap<String, Subscription>();
 		ArrayList<Invoice> invoices = new ArrayList<Invoice>();
+		HashMap<String, Customer> customers = new HashMap<String, Customer>();
+		HashMap<String, Subscription> subscriptions = new HashMap<String, Subscription>();
 
 		try
 		{
 			if(isInitialFetch(mode))
 			{
 				logger.log(Level.INFO, "\n\tInitial Fetch");
-				InvoiceListRequest request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID);
-				invoices = getInvoiceList(request);
+				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID);
+				invoices = getInvoices(request, customers, subscriptions);
 			}
 			else if (isSync(mode))
 			{
 				logger.log(Level.INFO, "\n\tSynchronization Process");
-				invoices = getInvoiceList(updCustomers, updSubscriptions);
+				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).updatedAt().after(new Timestamp(getCBLastSyncTime()));
+				invoices = getInvoices(request, customers, subscriptions);
+				updateInvoices(invoices, customers, subscriptions);
 			}
 			else if (isFailedInvProcess(mode))
 			{
 				logger.log(Level.INFO, "\n\tFailed Invoice Process");
 				JSONObject failedInvoices = thirdPartyMapping.getJSONObject(CBSSIConstants.FailedInvDets);
-				invoices = getInvoiceList(failedInvoices, updCustomers, updSubscriptions);
+				if (failedInvoices.length() == 0) // If no failed invoices.
+				{
+					return;
+				}
+				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).id().in(listAsArray(failedInvoices.names()));
+				invoices = getInvoices(request, customers, subscriptions);
 			}
 			for (int i = 0; i < invoices.size(); i++)
 			{
@@ -189,8 +204,8 @@ public class CBSSIntegration
 				{
 					continue;
 				}
-				Subscription subscription = Subscription.retrieve(subscrpId).request().subscription();
-				Customer customer = Customer.retrieve(customerId).request().customer();
+				Customer customer = customers.get(customerId);
+				Subscription subscription = subscriptions.get(subscrpId);
 				billingPeriod = subscription.billingPeriod(); // handling of recurring Invoices
 				logger.log(Level.INFO,
 						"\n\t invoice : " + invoiceId + " billingPeriod : " + billingPeriod);
@@ -302,59 +317,59 @@ public class CBSSIntegration
 	updThirdPartyMapping("Third Party Mapping");
 	}
 
-	private ArrayList<Invoice> getInvoiceList(HashMap<String, Customer> updCustomers,
-			HashMap<String, Subscription> updSubscriptions) throws Exception
+	private ArrayList<Invoice> getInvoices(InvoiceListRequest request, HashMap<String, Customer> customers, HashMap<String, Subscription> subscriptions) throws Exception
 	{
-		InvoiceListRequest invoices = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).updatedAt().after(new Timestamp(getCBLastSyncTime()));
-		CustomerListRequest customers = Customer.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime()));
-		SubscriptionListRequest subscriptions = Subscription.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime()));
-		ArrayList<Invoice> list = getInvoiceList(invoices);
-		updCustomers = getUpdatedCustomers(customers);
-		updSubscriptions = getUpdatedSubscriptions(subscriptions);
-		updateInvoiceList(list, updCustomers, updSubscriptions);
-		return list;
-	}
-
-	private ArrayList<Invoice> getInvoiceList(JSONObject failedInvoices, HashMap<String, Customer> updCustomers, HashMap<String, Subscription> updSubscriptions) throws Exception
-	{
-		if (failedInvoices.length() == 0) // If no failed invoices.
-		{
-			return new ArrayList<Invoice>();
-		}
-		JSONObject invIdVsCusId = thirdPartyMapping.getJSONObject(CBSSIConstants.CBInvIdVsCBCusId);
-		JSONObject invIdVsSubId = thirdPartyMapping.getJSONObject(CBSSIConstants.CBInvIdVsCBSubId);
-		InvoiceListRequest invoices = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).id().in(listAsCSV(failedInvoices.names()));
-		CustomerListRequest customers = Customer.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime())).id().in(getFailedList(invIdVsCusId, failedInvoices));
-		SubscriptionListRequest subscriptions = Subscription.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime())).id().in(getFailedList(invIdVsSubId, failedInvoices));
-		ArrayList<Invoice> list = getInvoiceList(invoices);
-		updCustomers = getUpdatedCustomers(customers);
-		updSubscriptions = getUpdatedSubscriptions(subscriptions);
-		return list;
-	}
-
-	private ArrayList<Invoice> getInvoiceList(InvoiceListRequest request) throws Exception
-	{
+		logger.log(Level.INFO, "\n\tMethod : getInvoices");
+		int length;
 		Invoice invoice;
 		ListResult result;
 		String nextOffset = null;
-		ArrayList<Invoice> list = new ArrayList<Invoice>();
+		String customer;
+		String subscription;
+		ArrayList<Invoice> invoiceList = new ArrayList<Invoice>();
+		JSONObject cusList = new JSONObject();
+		JSONObject subList = new JSONObject();
 		do
 		{
 			InvoiceListRequest invoices = request;
 			result = invoices.offset(nextOffset).request();
 			nextOffset = result.nextOffset();
-			for (int i = 0; i < result.size(); i++)
+			length = result.size();
+			logger.log(Level.INFO, "\n\tresult size : " + length);
+			for (int i = 0; i < length; i++)
 			{
 				invoice = result.get(i).invoice();
-				list.add(invoice);
+				invoiceList.add(invoice);
+				customer = invoice.customerId();
+				if(!cusList.has(customer))
+				{
+					cusList.put(customer, i);
+				}
+				subscription = invoice.subscriptionId();
+				if(!subList.has(subscription))
+				{
+					subList.put(subscription, i);
+				}
 			}
 		}
 		while(nextOffset != null);
-		return list;
+		if(customers != null)
+		{
+			CustomerListRequest  cutomerRequest = Customer.list().limit(100).id().in(listAsArray(cusList.names()));
+			customers.putAll(getCustomers(cutomerRequest));
+		}
+		if(subscriptions != null)
+		{
+			SubscriptionListRequest subscriptionRequest = Subscription.list().limit(100).id().in(listAsArray(subList.names()));
+			subscriptions.putAll(getSubscriptions(subscriptionRequest));
+		}
+		
+		return invoiceList;
 	}
 
-	private HashMap<String, Customer> getUpdatedCustomers(CustomerListRequest request) throws Exception
+	private HashMap<String, Customer> getCustomers(CustomerListRequest request) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : getCustomers");
 		Customer customer;
 		ListResult result;
 		String nextOffset = null;
@@ -364,6 +379,7 @@ public class CBSSIntegration
 			CustomerListRequest customers = request;
 			result = customers.offset(nextOffset).request();
 			nextOffset = result.nextOffset();
+			logger.log(Level.INFO, "\n\tresult size : " + result.size());
 			for (int i = 0; i < result.size(); i++)
 			{
 				customer = result.get(i).customer();
@@ -374,8 +390,9 @@ public class CBSSIntegration
 		return updCustomers;
 	}
 
-	private HashMap<String, Subscription> getUpdatedSubscriptions(SubscriptionListRequest request) throws Exception
+	private HashMap<String, Subscription> getSubscriptions(SubscriptionListRequest request) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : getSubscriptions");
 		ListResult result;
 		String nextOffset = null;
 		Subscription subscription;
@@ -385,6 +402,7 @@ public class CBSSIntegration
 			SubscriptionListRequest subscriptions = request;
 			result = subscriptions.offset(nextOffset).request();
 			nextOffset = result.nextOffset();
+			logger.log(Level.INFO, "\n\tresult size : " + result.size());
 			for (int i = 0; i < result.size(); i++)
 			{
 				subscription = result.get(i).subscription();
@@ -395,92 +413,95 @@ public class CBSSIntegration
 		return updSubscriptions;
 	}
 
-	private void updateInvoiceList(ArrayList<Invoice> list, HashMap<String, Customer> updCustomers,
-			HashMap<String, Subscription> updSubscriptions) throws Exception
+	private void updateInvoices(ArrayList<Invoice> invoices, HashMap<String, Customer> customers,
+			HashMap<String, Subscription> subscriptions) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : updateInvoices");
 		Invoice invoice;
-		String customer;
-		String subscription;
-		ArrayList<Invoice> invoiceList = new ArrayList<Invoice>();
+		CustomerListRequest customerRequest = Customer.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime()));
+		SubscriptionListRequest subscriptionReqest = Subscription.list().limit(100).updatedAt().after(new Timestamp(getCBLastSyncTime()));
+		HashMap<String, Customer> updCustomers = getCustomers(customerRequest);
+		HashMap<String, Subscription> updSubscriptions = getSubscriptions(subscriptionReqest);
+		ArrayList<Invoice> updCusInvoices = new ArrayList<Invoice>();
+		ArrayList<Invoice> updSubInvoices = new ArrayList<Invoice>();
 		
-		for(int i = 0; i < list.size(); i++)
-		{
-			invoice = list.get(i);
-			customer = invoice.customerId();
-			subscription = invoice.subscriptionId();
-			// removing customers whose invoices are already in updated invoice list
-			for(int j = 0; j < updCustomers.size(); j++)
-			{
-				if(updCustomers.containsKey(customer))
-				{
-					updCustomers.remove(customer);
-				}
-			}
-			// removing subscriptions whose invoices are already in updated invoice list
-			for(int j = 0; j < updSubscriptions.size(); j++)
-			{
-				if(updSubscriptions.containsKey(subscription))
-				{
-					updSubscriptions.remove(subscription);
-				}
-			}
-		}
-		//getting invoices of updated customers and subscriptions which are not present in updated invoice list
+		//getting invoice list of updated customers and subscriptions
 		if(updCustomers.size() != 0)
 		{
-			InvoiceListRequest cusInvList = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).customerId().in(listAsCSV(updCustomers.keySet()));
-			invoiceList.addAll(getInvoiceList(cusInvList));
+			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).customerId().in(listAsArray(updCustomers.keySet()));
+			updCusInvoices = getInvoices(invoiceRequest, null, null);
 		}
 		if(updSubscriptions.size() != 0)
 		{
-			InvoiceListRequest subInvList = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).subscriptionId().in(listAsCSV(updSubscriptions.keySet()));
-			invoiceList.addAll(getInvoiceList(subInvList));
+			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).subscriptionId().in(listAsArray(updSubscriptions.keySet()));
+			updSubInvoices = getInvoices(invoiceRequest, null, null);
 		}
-		
-		
-		for(int i = 0; i < invoiceList.size(); i++)
+		//removing already existing invoices and invoices need not to be updated
+		for(int i = 0; i < updCusInvoices.size(); i++)
 		{
-			invoice = invoiceList.get(i);
-			//removing invoices whose corresponding customers and subscriptions addresses are not updated
-			if(isSameAddress(invoice.billingAddress(), updCustomers.get(invoice.customerId()).billingAddress()) && isSameAddress(invoice.shippingAddress(), updSubscriptions.get(invoice.subscriptionId()).shippingAddress()))
+			invoice = updCusInvoices.get(i);
+			BillingAddress invBillAdd = invoice.billingAddress();
+			Customer.BillingAddress cusBillAdd = updCustomers.get(invoice.customerId()).billingAddress();
+			if(invBillAdd == null && cusBillAdd == null)
 			{
-				invoiceList.remove(i);
+				updCusInvoices.remove(invoice);
+			}
+			else if (invBillAdd != null && cusBillAdd != null && isSameAddress(invBillAdd, cusBillAdd))
+			{
+				updCusInvoices.remove(invoice);
+			}
+			if(invoices.contains(invoice));
+			{
+				updCusInvoices.remove(invoice);
 			}
 		}
-		list.addAll(invoiceList);
+		//removing already existing invoices and invoices need not to be updated
+		for(int i = 0; i < updSubInvoices.size(); i++)
+		{
+			invoice = updSubInvoices.get(i);
+			ShippingAddress invShippAdd = invoice.shippingAddress();
+			Subscription.ShippingAddress subShippAdd = updSubscriptions.get(invoice.subscriptionId()).shippingAddress();
+			if(invShippAdd == null && subShippAdd == null)
+			{
+				updSubInvoices.remove(invoice);
+			}
+			else if (invShippAdd != null && subShippAdd != null && isSameAddress(invShippAdd, subShippAdd))
+			{
+				updSubInvoices.remove(invoice);
+			}
+			else if(invoices.contains(invoice));
+			{
+				updSubInvoices.remove(invoice);
+			}
+		}
+		//removing already existing invoices
+		for(int i = 0; i < updSubInvoices.size(); i++)
+		{
+			invoice = updSubInvoices.get(i);
+			if(updCusInvoices.contains(invoice));
+			{
+				updSubInvoices.remove(invoice);
+			}
+		}
+		customers.putAll(updCustomers);
+		subscriptions.putAll(updSubscriptions);
+		invoices.addAll(updCusInvoices);
+		invoices.addAll(updSubInvoices);
 	}
 
-	private String listAsCSV(Set<String> keys)
+	private String[] listAsArray(Set<String> keys)
 	{
-		StringBuilder builder = new StringBuilder();
+		logger.log(Level.INFO, "\n\tMethod : listAsArray");
+		int length = keys.size();
+		String[] array = new String[length];
 		Iterator<String> it = keys.iterator();
-		while(it.hasNext())
+		for(int i = 0; i < length; i++)
 		{
-			builder.append(it.next());
-			if(it.hasNext())
-			{
-				builder.append(",");
-			}
+			array[i] = it.next();
 		}
-		return builder.toString();
+		return array;
 	}
-
-	private String getFailedList(JSONObject object, JSONObject failedInvoices) throws Exception //returns customers or subscriptions of failed invoices
-	{
-		JSONArray array = new JSONArray();
-		JSONArray invoices = failedInvoices.names();// Failed_Invoices
-		String invoice;
-		for(int i = 0; i < invoices.length(); i++)
-		{
-			invoice = invoices.getString(i);
-			if(object.has(invoice))// object may be invoice_vs_customer or invoice_vs_subscription
-			{
-				array.put(object.getString(invoice));// array may be Customers or Subscriptions 
-			}
-		}
-		return listAsCSV(array);
-	}
-
+	
 	private void updCBInvIdVsCBCusId(String invoiceId, String customerId) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tMethod : updCBInvIdVsCBCusId");
@@ -562,6 +583,7 @@ public class CBSSIntegration
 
 	private boolean checkFailedInvoice(String invoiceId) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : checkFailedInvoice");
 		JSONObject failedInvoices = thirdPartyMapping.getJSONObject(CBSSIConstants.FailedInvDets);
 		if (failedInvoices.has(invoiceId))
 		{
@@ -573,7 +595,7 @@ public class CBSSIntegration
 	private Date getOrderDate(int index, BillingPeriodUnit billingPeriodUnit, Invoice invoice)
 			throws Exception
 	{
-		logger.log(Level.INFO, "\n\tindex : " + String.valueOf(index));
+		logger.log(Level.INFO, "\n\tMethod : getOrderDate");
 
 		Timestamp orgDate = invoice.date();
 		Calendar cal = Calendar.getInstance();
@@ -774,15 +796,17 @@ public class CBSSIntegration
 	private boolean hasValidBillingAddress(Invoice invoice, Customer customer, JSONObject ssOrder, int mode) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
-		if (invoice.billingAddress() == null && customer.billingAddress() == null)
+		BillingAddress invBillAdd = invoice.billingAddress();
+		logger.log(Level.INFO, "\n\tinvBillAdd : " + invBillAdd);
+		Customer.BillingAddress cusBillAdd = customer.billingAddress();
+		logger.log(Level.INFO, "\n\tcusBillAdd : " + cusBillAdd);
+		if (invBillAdd == null && cusBillAdd == null)
 		{
 			logger.log(Level.INFO, "\n\tinvoice : " + invoice.id() + ", has no valid billing address");
 			return false;
 		}
 		JSONObject object = new JSONObject();
-		BillingAddress invBillAdd = invoice.billingAddress();
-		Customer.BillingAddress cusBillAdd = customer.billingAddress();
-		if(hasValidInvBillAdd(invBillAdd) && hasValidCusBillAdd(cusBillAdd))
+		if(invBillAdd != null && cusBillAdd != null && hasValidInvBillAdd(invBillAdd) && hasValidCusBillAdd(cusBillAdd))
 		{
 			if(isSameAddress(invBillAdd, cusBillAdd))
 			{
@@ -794,11 +818,11 @@ public class CBSSIntegration
 			}
 			
 		}
-		else if(hasValidInvBillAdd(invBillAdd))
+		else if(invBillAdd != null && hasValidInvBillAdd(invBillAdd))
 		{	
 			fillInvBillAdd(invBillAdd, object);
 		}
-		else if(hasValidCusBillAdd(cusBillAdd))
+		else if(cusBillAdd != null && hasValidCusBillAdd(cusBillAdd))
 		{	
 			fillCusBillAdd(cusBillAdd, object);
 		}
@@ -1008,15 +1032,15 @@ public class CBSSIntegration
 
 	public Boolean hasValidShippingAddress(Invoice invoice, Subscription subscription, JSONObject ssOrder, int mode) throws Exception
 	{
-		if (invoice.shippingAddress() == null && subscription.shippingAddress() == null)
+		ShippingAddress invShippAdd = invoice.shippingAddress();
+		Subscription.ShippingAddress subShippAdd = subscription.shippingAddress();
+		if (invShippAdd == null && subShippAdd == null)
 		{
 			ssOrder.put("shipTo", ssOrder.getJSONObject("billTo"));
 			return true;
 		}
 		JSONObject object = new JSONObject();
-		ShippingAddress invShippAdd = invoice.shippingAddress();
-		Subscription.ShippingAddress subShippAdd = subscription.shippingAddress();
-		if(!isInitialFetch(mode) && hasValidInvShippAdd(invShippAdd) && hasValidSubShippAdd(subShippAdd))
+		if(invShippAdd != null && subShippAdd != null && !isInitialFetch(mode) && hasValidInvShippAdd(invShippAdd) && hasValidSubShippAdd(subShippAdd))
 		{
 			if(isSameAddress(invShippAdd, subShippAdd))
 			{
@@ -1028,11 +1052,11 @@ public class CBSSIntegration
 			}
 			
 		}
-		else if(hasValidInvShippAdd(invShippAdd))
+		else if(invShippAdd != null && hasValidInvShippAdd(invShippAdd))
 		{
 			fillInvShippAdd(invShippAdd, object);
 		}
-		else if(hasValidSubShippAdd(subShippAdd))
+		else if(subShippAdd != null && hasValidSubShippAdd(subShippAdd))
 		{	
 			fillSubShippAdd(subShippAdd, object);
 		}
@@ -1356,10 +1380,10 @@ public class CBSSIntegration
 	{
 		logger.log(Level.INFO, "\n\tgetting shipstation orders");
 		Client client = ClientBuilder.newClient();
-		String orderStatus = null;
-		String customerNote = null;
-		String trackingId = null;
-		String batchId = null;
+		String orderStatus = "";
+		String customerNote = "";
+		String trackingId = "";
+		String batchId = "";
 		String orderNo;
 		String orderKey;
 		String invoiceId;
@@ -1398,11 +1422,7 @@ public class CBSSIntegration
 				{
 					ssOrdId = order.getString("orderId");
 					orderShipInfo = getShipmentInfo(orderNo);
-
-					if (order.has("orderStatus"))
-					{
-						orderStatus = order.getString("orderStatus");
-					}
+					orderStatus = order.getString("orderStatus");
 					if (order.has("customerNote"))
 					{
 						customerNote = order.getString("customerNote");
@@ -1478,7 +1498,7 @@ public class CBSSIntegration
 		if (cbOrdId == null) // new order
 		{
 
-			result = Order.create().id(ssOrdId).invoiceId(invoiceId).fulfillmentStatus(orderStatus)
+			result = Order.create().id(ssOrdId).invoiceId(invoiceId).status(CBSSIConstants.cbOrdStatusForSSOrdStatus.get(orderStatus)).fulfillmentStatus(orderStatus)
 					.referenceId(ssOrdId).batchId(batchId).note(customerNote).request();
 			order = result.order();
 			updSSOrderVsCBOrder(ssOrdId, order.id());
@@ -1545,19 +1565,16 @@ public class CBSSIntegration
 		return null;
 	}
 
-	private String listAsCSV(JSONArray failedInvoices) throws JSONException
+	private String[] listAsArray(JSONArray failedInvoices) throws JSONException
 	{
-		StringBuilder builder = new StringBuilder();
+		logger.log(Level.INFO, "\n\tMethod : listAsArray");
 		int length = failedInvoices.length();
+		String[] array = new String[length];
 		for (int i = 0; i < length; i++)
 		{
-			builder.append(failedInvoices.get(i));
-			if (i != (length - 1))
-			{
-				builder.append(",");
-			}
+			array[i] = failedInvoices.getString(i);
 		}
-		return builder.toString();
+		return array;
 	}
 
 	private JSONObject getThirdPartyMapping() throws JSONException
@@ -1598,33 +1615,9 @@ public class CBSSIntegration
 
 	private String getOrderStatus(String invoiceStatus) throws IOException
 	{
-		logger.log(Level.INFO, "\n\tinvoiceStatus" + invoiceStatus);
-
-		String status = null;
-
-		if (invoiceStatus.equals(CBSSIConstants.cbPending))
-		{
-			status = CBSSIConstants.ssOnHold;
-		}
-		else if (invoiceStatus.equals(CBSSIConstants.cbVoided))
-		{
-			status = CBSSIConstants.ssCancelled;
-		}
-		else if (invoiceStatus.equals(CBSSIConstants.cbNotPaid)
-				|| invoiceStatus.equals(CBSSIConstants.cbPaymentDue))
-		{
-			status = CBSSIConstants.ssAwaitingPay;
-		}
-		else if (invoiceStatus.equals(CBSSIConstants.cbPaid))
-		{
-			status = CBSSIConstants.ssAwaitingShip;
-		}
-		else if (invoiceStatus.equals(CBSSIConstants.cbPosted))
-		{
-			status = CBSSIConstants.ssShipped;
-		}
-
-		return status;
+		logger.log(Level.INFO, "\n\tMethod : getOrderStatus");
+		
+		return CBSSIConstants.ssOrdStatusOfCBInvStatus.get(invoiceStatus);
 	}
 
 }

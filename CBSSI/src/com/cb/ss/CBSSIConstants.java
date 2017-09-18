@@ -3,6 +3,8 @@ package com.cb.ss;
 import java.util.Base64;
 import java.util.HashMap;
 
+import com.chargebee.models.Order.Status;
+
 public class CBSSIConstants
 {
 
@@ -23,7 +25,7 @@ public class CBSSIConstants
 	final static String cbPaid = "PAID";
 	final static String cbPaymentDue = "PAYMENT_DUE";
 	final static String cbPosted = "POSTED";
-	
+
 	/////////////// ShipStation Api_End_Points And Constants /////////////////
 
 	final static String orderKey = "orderKey";
@@ -52,7 +54,6 @@ public class CBSSIConstants
 			put("GB", "GBP");
 		}
 	};
-	
 	/////////////// Thirdparty_Mapping Fields /////////////////
 	
 	final static String CBInvIdVsCBCusId = "cbinvid-cbcusid";
@@ -67,5 +68,26 @@ public class CBSSIConstants
 	final static String CBOrdVsSSOrd = "cbord-vs-ssord";
 	final static String CBLastSyncTime = "cb-last-sync-time";
 	final static String SSLastSyncTime = "ss-last-sync-time";
+	
+	final static HashMap<String, Status> cbOrdStatusForSSOrdStatus = new HashMap<String, Status>()
+	{
+		{
+			put("awaiting_payment", Status.VOIDED);
+			put("awaiting_shipment", Status.PROCESSING);
+			put("on_hold", Status.VOIDED);
+			put("shipped", Status.COMPLETE);
+			put("cancelled", Status.CANCELLED);
+		}
+	};
 
+	final static HashMap<String, String> ssOrdStatusOfCBInvStatus = new HashMap<String, String>()
+	{
+		{
+			put("PAYMENT_DUE", "awaiting_payment");
+			put("PAID", "awaiting_shipment");
+			put("PENDING", "on_hold");
+			put("POSTED", "shipped");
+			put("VOIDED", "cancelled");
+		}
+	};
 }
