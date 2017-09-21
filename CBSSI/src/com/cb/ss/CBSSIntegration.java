@@ -32,6 +32,8 @@ import com.chargebee.Environment;
 import com.chargebee.ListResult;
 import com.chargebee.Result;
 import com.chargebee.exceptions.InvalidRequestException;
+import com.chargebee.models.CreditNote;
+import com.chargebee.models.CreditNote.CreditNoteListRequest;
 import com.chargebee.models.Customer;
 import com.chargebee.models.Customer.CustomerListRequest;
 import com.chargebee.models.Invoice;
@@ -68,8 +70,8 @@ public class CBSSIntegration
 				CBSSIConstants.ssKey);
 		integ.initSync();
 		logger.log(Level.INFO, "\n\tInitial Fetch Finished");
-		Thread.sleep(120000);
-		integ.sync();
+//		Thread.sleep(360000);
+//		integ.sync();
 	}
 
 	private String getCBTimeZone(Date date)
@@ -199,6 +201,7 @@ public class CBSSIntegration
 				request = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).id().in(listAsArray(failedInvoices.names()));
 				invoices = getInvoices(request, customers, subscriptions);
 			}
+
 			Iterator<Entry<String, Invoice>> invIterator = invoices.entrySet().iterator();
 			Entry<String, Invoice> entry;
 			while(invIterator.hasNext())
@@ -210,7 +213,6 @@ public class CBSSIntegration
 				subscrpId = invoice.subscriptionId();
 				Customer customer = customers.get(customerId);
 				Subscription subscription = subscriptions.get(subscrpId);
-
 				if (!isFailedInvProcess(mode) && checkFailedInvoice(invoiceId))
 				{
 					continue;
@@ -422,7 +424,6 @@ public class CBSSIntegration
 			HashMap<String, Subscription> subscriptions) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tMethod : updateInvoices");
-		Invoice invoice;
 		CustomerListRequest customerRequest = Customer.list().limit(100);
 		SubscriptionListRequest subscriptionReqest = Subscription.list().limit(100);
 		if(getCBLastSyncTime() != null)
@@ -433,53 +434,19 @@ public class CBSSIntegration
 		}
 		HashMap<String, Customer> updCustomers = getCustomers(customerRequest);
 		HashMap<String, Subscription> updSubscriptions = getSubscriptions(subscriptionReqest);
-		HashMap<String, Invoice> updCusInvoices = new HashMap<String, Invoice>();
-		HashMap<String, Invoice> updSubInvoices = new HashMap<String, Invoice>();
 		//getting invoice list of updated customers and subscriptions
 		if(updCustomers.size() != 0)
 		{
 			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).customerId().in(listAsArray(updCustomers.keySet()));
-			updCusInvoices = getInvoices(invoiceRequest, null, null);
+			invoices.putAll(getInvoices(invoiceRequest, null, null));
+			customers.putAll(updCustomers);
 		}
 		if(updSubscriptions.size() != 0)
 		{
 			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).subscriptionId().in(listAsArray(updSubscriptions.keySet()));
-			updSubInvoices = getInvoices(invoiceRequest, null, null);
+			invoices.putAll(getInvoices(invoiceRequest, null, null));
+			subscriptions.putAll(updSubscriptions);
 		}
-		Iterator<Entry<String, Invoice>> cusInvIterator = updCusInvoices.entrySet().iterator();
-		Iterator<Entry<String, Invoice>> subInvIterator = updSubInvoices.entrySet().iterator();
-		Entry<String, Invoice> entry;
-		String invoiceId;
-		//removing already existing invoices and invoices need not to be updated
-		while(cusInvIterator.hasNext())
-		{
-			entry = cusInvIterator.next();
-			invoiceId = entry.getKey();
-			invoice = entry.getValue();
-			BillingAddress invBillAdd = invoice.billingAddress();
-			Customer.BillingAddress cusBillAdd = updCustomers.get(invoice.customerId()).billingAddress();
-			if(invoices.containsKey(invoiceId) || (invBillAdd == null && cusBillAdd == null) || (invBillAdd != null && cusBillAdd != null && isSameAddress(invBillAdd, cusBillAdd)));
-			{
-				updCusInvoices.remove(invoiceId);
-			}
-		}
-		//removing already existing invoices and invoices need not to be updated
-		while(subInvIterator.hasNext())
-		{
-			entry = subInvIterator.next();
-			invoiceId = entry.getKey();
-			invoice = entry.getValue();
-			ShippingAddress invShippAdd = invoice.shippingAddress();
-			Subscription.ShippingAddress subShippAdd = updSubscriptions.get(invoice.subscriptionId()).shippingAddress();
-			if(updCusInvoices.containsKey(invoiceId) || invoices.containsKey(invoiceId) || (invShippAdd == null && subShippAdd == null) || (invShippAdd != null && subShippAdd != null && isSameAddress(invShippAdd, subShippAdd)));
-			{
-				updSubInvoices.remove(invoiceId);
-			}
-		}
-		customers.putAll(updCustomers);
-		subscriptions.putAll(updSubscriptions);
-		invoices.putAll(updCusInvoices);
-		invoices.putAll(updSubInvoices);
 	}
 
 	private String[] listAsArray(Set<String> keys)
@@ -774,7 +741,6 @@ public class CBSSIntegration
 	{
 		handlePreviousFailedInvoice();
 		logger.log(Level.INFO, "\n\tFailed Invoice Process Finished");
-		Thread.sleep(120000);
 		processSync(CBSSIConstants.SYNC);
 		logger.log(Level.INFO, "\n\tSync Process Finished");
 	}
