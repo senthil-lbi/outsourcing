@@ -2,6 +2,7 @@ package com.cb.ss;
 
 import com.chargebee.models.CreditNote;
 import com.chargebee.models.Invoice;
+import com.chargebee.models.Invoice.Status;
 
 public class CBSSUserConfig
 {
@@ -12,9 +13,9 @@ public class CBSSUserConfig
 		return true;
 	}
 
-	public static String[] getOrderStatus()
+	public static Status[] getOrderStatus()
 	{
-		return new String[] { Invoice.Status.PAID.toString() };
+		return new Status[] { Invoice.Status.PAID };
 	}
 
 	public static boolean handleCreditNotes()

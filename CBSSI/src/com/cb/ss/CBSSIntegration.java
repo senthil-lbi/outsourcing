@@ -66,7 +66,7 @@ public class CBSSIntegration
 				CBSSIConstants.ssKey);
 		integ.initSync();
 		logger.log(Level.INFO, "\n\tInitial Fetch Finished");
-		Thread.sleep(240000);
+		Thread.sleep(120000);
 		integ.sync();
 	}
 
@@ -149,19 +149,20 @@ public class CBSSIntegration
 	{
 		logger.log(Level.INFO, "\n\tMethod : processSync");
 		int count = 0;
-		Response response;
-		JSONObject ssOrder;
-		int billingPeriod;
 		Date orderDate;
 		Invoice invoice;
 		String invoiceId;
 		String subscrpId;
+		JSONObject order;
+		int billingPeriod;
+		Response response;
 		String customerId;
+		long ssLastSyncTime;
 		InvoiceListRequest request;
+		JSONArray orders = new JSONArray();
 		Environment.configure(cbSite, cbApiKey);
-		JSONArray ssAllOrders = new JSONArray();
 		JSONObject orderVsInvoice = new JSONObject();
-		long lastSyncTime = System.currentTimeMillis();
+		long cbLastSyncTime = System.currentTimeMillis();
 		ArrayList<Invoice> invoices = new ArrayList<Invoice>();
 		HashMap<String, Customer> customers = new HashMap<String, Customer>();
 		HashMap<String, Subscription> subscriptions = new HashMap<String, Subscription>();
@@ -171,13 +172,17 @@ public class CBSSIntegration
 			if(isInitialFetch(mode))
 			{
 				logger.log(Level.INFO, "\n\tInitial Fetch");
-				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID);
+				request = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus());
 				invoices = getInvoices(request, customers, subscriptions);
 			}
 			else if (isSync(mode))
 			{
 				logger.log(Level.INFO, "\n\tSynchronization Process");
-				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).updatedAt().after(new Timestamp(getCBLastSyncTime()));
+				request = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus());
+				if(getCBLastSyncTime() != null)
+				{
+					request.updatedAt().after(new Timestamp(getCBLastSyncTime()));
+				}
 				invoices = getInvoices(request, customers, subscriptions);
 				updateInvoices(invoices, customers, subscriptions);
 			}
@@ -189,43 +194,45 @@ public class CBSSIntegration
 				{
 					return;
 				}
-				request = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).id().in(listAsArray(failedInvoices.names()));
+				request = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).id().in(listAsArray(failedInvoices.names()));
 				invoices = getInvoices(request, customers, subscriptions);
 			}
-			for (int i = 0; i < invoices.size(); i++)
+			int invLength = invoices.size();
+			for (int i = 0; i < invLength; i++)
 			{
 				invoice = invoices.get(i);
 				invoiceId = invoice.id();
 				subscrpId = invoice.subscriptionId();
 				customerId = invoice.customerId();
-				updCBInvIdVsCBCusId(invoiceId, customerId);
-				updCBInvIdVsCBSubId(invoiceId, subscrpId);
+				updInvoiceVsSubscription(invoiceId, customerId);
+				updInvoiceVsSubscription(invoiceId, subscrpId);
 				if (checkFailedInvoice(invoiceId) && !isFailedInvProcess(mode))
 				{
 					continue;
 				}
 				Customer customer = customers.get(customerId);
 				Subscription subscription = subscriptions.get(subscrpId);
+				subscription.addons();
+				subscription.planId();
+				subscription.coupons();
 				billingPeriod = subscription.billingPeriod(); // handling of recurring Invoices
-				logger.log(Level.INFO,
-						"\n\t invoice : " + invoiceId + " billingPeriod : " + billingPeriod);
 				for (int j = 0; j < billingPeriod; j++)
 				{
 					orderDate = getOrderDate(j, subscription.billingPeriodUnit(), invoice);
-					ssOrder = new JSONObject();
-					fillCustomerInfo(invoice, customer, ssOrder);
+					order = new JSONObject();
+					fillCustomerInfo(invoice, customer, order);
 					
-					if (!hasValidBillingAddress(invoice, customer, ssOrder, mode))
+					if (!hasValidBillingAddress(invoice, customer, order, mode))
 					{
-						logger.log(Level.INFO, "\n\tfailed invoice : " + invoiceId
-								+ "is failed due to invalid billing address");
+						logger.log(Level.INFO, "\n\tInvoice : " + invoiceId
+								+ " is failed due to invalid billing address");
 
 						j = billingPeriod;
 						updateFailedInvoice(invoiceId, "Invalid Billing Address");
 						continue;
 					}
 
-					if (!hasValidShippingAddress(invoice, subscription, ssOrder, mode))
+					if (!hasValidShippingAddress(invoice, subscription, order, mode))
 					{
 						logger.log(Level.INFO, "\n\tInvoice " + invoiceId
 								+ "is failed due to invalid shipping address");
@@ -234,55 +241,52 @@ public class CBSSIntegration
 						updateFailedInvoice(invoiceId, "Invalid Shipping Address");
 						continue;
 					}
-					fillOrders(j, invoice, ssOrder, orderDate, orderVsInvoice, mode, billingPeriod);
-					ssAllOrders.put(ssOrder);
+					fillOrders(j, invoice, order, orderDate, orderVsInvoice, mode, billingPeriod);
+					orders.put(order);
 					if (count == 99)
 					{
-						// logger.log(Level.INFO, "ssAllOrders : " + ssAllOrders.toString());
-						response = createShipStationOrders(ssAllOrders);
-						JSONObject respJSON = handleResponse(response, ssAllOrders,
-								orderVsInvoice);
-						if (response.getStatus() == HttpStatus.SC_OK
-								|| response.getStatus() == HttpStatus.SC_ACCEPTED)
+						response = createShipStationOrders(orders);
+						JSONArray ssOrders = handleResponse(response, orders, orderVsInvoice);
+						if (ssOrders != null)
 						{
-
-							if (i == invoices.size()-1)
+							ssLastSyncTime = System.currentTimeMillis();
+							if (i == invLength-1 && j == billingPeriod-1)
 							{
 								if (isFailedInvProcess(mode))
 								{
 									updThirdPartyMapping("Third Party Mapping");
 									return;
 								}
-								updCBLastSyncTime(lastSyncTime);
+								updCBLastSyncTime(cbLastSyncTime);
 							}
-							createCBOrders(respJSON, mode);
-							updSSLastSyncTime(lastSyncTime);
+							createCBOrders(ssOrders, mode);
+							updSSLastSyncTime(ssLastSyncTime);
 						}
-						ssAllOrders = new JSONArray();
+						orders = new JSONArray();
 						logger.log(Level.INFO, "count : " + count);
 						count = 0;
 					}
+					count++;
 				}
-				count++;
 			}
-			// logger.log(Level.INFO, "ssAllOrders : " + ssAllOrders.toString());
+			// logger.log(Level.INFO, "orders : " + orders.toString());
 			if (count > 0)
 			{
-				response = createShipStationOrders(ssAllOrders);
-				JSONObject respJSON = handleResponse(response, ssAllOrders, orderVsInvoice);
-				if (response.getStatus() == HttpStatus.SC_OK
-						|| response.getStatus() == HttpStatus.SC_ACCEPTED)
+				response = createShipStationOrders(orders);
+				JSONArray ss = handleResponse(response, orders, orderVsInvoice);
+				if (ss != null)
 				{
+					ssLastSyncTime = System.currentTimeMillis();
 					if (isFailedInvProcess(mode))
 					{
 						updThirdPartyMapping("Third Party Mapping");
 						return;
 					}
-					updCBLastSyncTime(lastSyncTime);
-					createCBOrders(respJSON, mode);
-					updSSLastSyncTime(lastSyncTime);
+					updCBLastSyncTime(cbLastSyncTime);
+					createCBOrders(ss, mode);
+					updSSLastSyncTime(ssLastSyncTime);
 				}
-				ssAllOrders = new JSONArray();
+				orders = new JSONArray();
 				logger.log(Level.INFO, "count : " + count);
 				count = 0;
 			}
@@ -353,13 +357,10 @@ public class CBSSIntegration
 			}
 		}
 		while(nextOffset != null);
-		if(customers != null)
+		if(length != 0)
 		{
 			CustomerListRequest  cutomerRequest = Customer.list().limit(100).id().in(listAsArray(cusList.names()));
 			customers.putAll(getCustomers(cutomerRequest));
-		}
-		if(subscriptions != null)
-		{
 			SubscriptionListRequest subscriptionRequest = Subscription.list().limit(100).id().in(listAsArray(subList.names()));
 			subscriptions.putAll(getSubscriptions(subscriptionRequest));
 		}
@@ -428,12 +429,12 @@ public class CBSSIntegration
 		//getting invoice list of updated customers and subscriptions
 		if(updCustomers.size() != 0)
 		{
-			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).customerId().in(listAsArray(updCustomers.keySet()));
+			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).customerId().in(listAsArray(updCustomers.keySet()));
 			updCusInvoices = getInvoices(invoiceRequest, null, null);
 		}
 		if(updSubscriptions.size() != 0)
 		{
-			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().is(Invoice.Status.PAID).subscriptionId().in(listAsArray(updSubscriptions.keySet()));
+			InvoiceListRequest invoiceRequest = Invoice.list().limit(100).includeDeleted(false).status().in(CBSSUserConfig.getOrderStatus()).subscriptionId().in(listAsArray(updSubscriptions.keySet()));
 			updSubInvoices = getInvoices(invoiceRequest, null, null);
 		}
 		//removing already existing invoices and invoices need not to be updated
@@ -502,7 +503,7 @@ public class CBSSIntegration
 		return array;
 	}
 	
-	private void updCBInvIdVsCBCusId(String invoiceId, String customerId) throws Exception
+	private void updInvoiceVsCustomer(String invoiceId, String customerId) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tMethod : updCBInvIdVsCBCusId");
 		JSONObject invIdVsCusId = thirdPartyMapping.getJSONObject(CBSSIConstants.CBInvIdVsCBCusId);
@@ -539,7 +540,7 @@ public class CBSSIntegration
 		thirdPartyMapping.put(CBSSIConstants.CBCusIdVsCBInvId, cusIdVsInvId);
 	}
 
-	private void updCBInvIdVsCBSubId(String invoiceId, String subscrpId) throws Exception
+	private void updInvoiceVsSubscription(String invoiceId, String subscrpId) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tMethod : updCBInvIdVsCBSubId");
 		JSONObject invIdVsSubId = thirdPartyMapping.getJSONObject(CBSSIConstants.CBInvIdVsCBSubId);
@@ -615,26 +616,26 @@ public class CBSSIntegration
 		return cal.getTime();
 	}
 
-	private JSONObject handleResponse(Response response, JSONArray ssAllOrders,
+	private JSONArray handleResponse(Response response, JSONArray orders,
 			JSONObject orderVsInvoice) throws Exception
 	{
-		JSONObject orders = null;
+		JSONArray ssOrders = null;
 		int status = response.getStatus();
 		if (status == HttpStatus.SC_OK || status == HttpStatus.SC_ACCEPTED)
 		{
-			orders = handleSuccessResponse(response, orderVsInvoice);
+			ssOrders = handleSuccessResponse(response, orderVsInvoice);
 		}
 		else
 		{
-			handleErrorResponse(response, ssAllOrders, orderVsInvoice);
+			handleErrorResponse(response, orders, orderVsInvoice);
 		}
-		return orders;
+		return ssOrders;
 	}
 
-	private void updOrdInThirdPartyMapping(JSONObject order, JSONObject orderVsInvoice)
+	private void updOrderVsInvoice(JSONObject order, JSONObject orderVsInvoice)
 			throws Exception
 	{
-		logger.log(Level.INFO, "\n\tMethod: updOrdInThirdPartyMapping");
+		logger.log(Level.INFO, "\n\tMethod : updOrderVsInvoice");
 
 		JSONObject cbInvIdVsSSOrdNo = thirdPartyMapping
 				.getJSONObject(CBSSIConstants.CBInvIdVSSOrdNo);
@@ -683,33 +684,28 @@ public class CBSSIntegration
 			thirdPartyMapping.put(CBSSIConstants.CBInvIdVSSOrdNo, cbInvIdVsSSOrdNo);
 			thirdPartyMapping.put(CBSSIConstants.SSOrdNoVsSSOrderKey, ssOrdNoVsSSOrdKey);
 			thirdPartyMapping.put(CBSSIConstants.SSOrdKeyVsCBInvId, ssOrdKeyVsCBInvId);
-			logger.log(Level.INFO, "\n\tCBInvIdVSSOrdNo updated : " + invoiceId + " - " + orderNo);
-			logger.log(Level.INFO,
-					"\n\tSSOrdNoVsSSOrderKey updated : " + orderNo + " - " + orderKey);
-			logger.log(Level.INFO,
-					"\n\tSSOrdKeyVsCBInvId updated : " + orderKey + " - " + invoiceId);
 			updateFailedInvoice(invoiceId);
 		}
 	}
 
-	private JSONObject handleSuccessResponse(Response response, JSONObject orderVsInvoice)
+	private JSONArray handleSuccessResponse(Response response, JSONObject orderVsInvoice)
 			throws Exception
 	{
 		logger.log(Level.INFO, "\n\tMethod: handleSuccessResponse");
 
-		JSONObject orders = new JSONObject(response.readEntity(String.class));
-		JSONArray results = orders.getJSONArray("results");
+		JSONObject object = new JSONObject(response.readEntity(String.class));
+		JSONArray orders = object.getJSONArray("results");
 		JSONObject order;
-		for (int i = 0; i < results.length(); i++)
+		for (int i = 0; i < orders.length(); i++)
 		{
-			order = results.getJSONObject(i);
-			updOrdInThirdPartyMapping(order, orderVsInvoice);
+			order = orders.getJSONObject(i);
+			updOrderVsInvoice(order, orderVsInvoice);
 			// logger.log(Level.INFO, "\n\torder : " + order.toString());
 		}
 		return orders;
 	}
 
-	private void handleErrorResponse(Response response, JSONArray ssAllOrders,
+	private void handleErrorResponse(Response response, JSONArray orders,
 			JSONObject orderVsInvoice) throws Exception
 	{
 		int status = response.getStatus();
@@ -722,15 +718,15 @@ public class CBSSIntegration
 		{
 			logger.log(Level.INFO, "\n\t" + status + " : " + messege + "( Rate Limit Exceeded)");
 			Thread.sleep(60000);
-			createShipStationOrders(ssAllOrders);
+			createShipStationOrders(orders);
 		}
 		else if ((status == HttpStatus.SC_UNAUTHORIZED) || (status == HttpStatus.SC_BAD_REQUEST)
 				|| (status == HttpStatus.SC_FORBIDDEN) || (status == HttpStatus.SC_NOT_FOUND)
 				|| status == HttpStatus.SC_INTERNAL_SERVER_ERROR)
 		{
-			while (failedInvoiceCount < ssAllOrders.length())
+			while (failedInvoiceCount < orders.length())
 			{
-				order = ssAllOrders.getJSONObject(failedInvoiceCount);
+				order = orders.getJSONObject(failedInvoiceCount);
 				orderNo = order.getString(CBSSIConstants.orderNumber);
 				invoiceId = orderVsInvoice.getString(orderNo);
 				updateFailedInvoice(invoiceId, "Internal Error");
@@ -739,6 +735,7 @@ public class CBSSIntegration
 			}
 			logger.log(Level.INFO, "\n\t" + status + " : " + messege
 					+ "(Wrong user credentials, NO user permissions to this api, Invalid api resource, Internal Error)");
+			updThirdPartyMapping(messege);
 			throw new RuntimeException(messege);
 		}
 	}
@@ -784,6 +781,7 @@ public class CBSSIntegration
 	{
 		handlePreviousFailedInvoice();
 		logger.log(Level.INFO, "\n\tFailed Invoice Process Finished");
+		Thread.sleep(120000);
 		processSync(CBSSIConstants.SYNC);
 		logger.log(Level.INFO, "\n\tSync Process Finished");
 	}
@@ -793,16 +791,13 @@ public class CBSSIntegration
 		processSync(CBSSIConstants.FAILED_INV_PROCESS);
 	}
 
-	private boolean hasValidBillingAddress(Invoice invoice, Customer customer, JSONObject ssOrder, int mode) throws Exception
+	private boolean hasValidBillingAddress(Invoice invoice, Customer customer, JSONObject order, int mode) throws Exception
 	{
-		logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
+		logger.log(Level.INFO, "\n\tMethod : hasValidBillingAddress");
 		BillingAddress invBillAdd = invoice.billingAddress();
-		logger.log(Level.INFO, "\n\tinvBillAdd : " + invBillAdd);
 		Customer.BillingAddress cusBillAdd = customer.billingAddress();
-		logger.log(Level.INFO, "\n\tcusBillAdd : " + cusBillAdd);
 		if (invBillAdd == null && cusBillAdd == null)
 		{
-			logger.log(Level.INFO, "\n\tinvoice : " + invoice.id() + ", has no valid billing address");
 			return false;
 		}
 		JSONObject object = new JSONObject();
@@ -810,28 +805,31 @@ public class CBSSIntegration
 		{
 			if(isSameAddress(invBillAdd, cusBillAdd))
 			{
+				logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
 				fillInvBillAdd(invBillAdd, object);
 			}
 			else
 			{
+				logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
 				fillCusBillAdd(cusBillAdd, object);
 			}
 			
 		}
 		else if(invBillAdd != null && hasValidInvBillAdd(invBillAdd))
 		{	
+			logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
 			fillInvBillAdd(invBillAdd, object);
 		}
 		else if(cusBillAdd != null && hasValidCusBillAdd(cusBillAdd))
 		{	
+			logger.log(Level.INFO, "\n\tFilling Billing address for invoice :: " + invoice.id());
 			fillCusBillAdd(cusBillAdd, object);
 		}
 		else
 		{
-			logger.log(Level.INFO, "\n\tinvoice : " + invoice.id() + ", has no valid billing address");
 			return false;
 		}
-		ssOrder.put("billTo", object);
+		order.put("billTo", object);
 		return true;
 	}
 	
@@ -1030,42 +1028,49 @@ public class CBSSIntegration
 		
 	}
 
-	public Boolean hasValidShippingAddress(Invoice invoice, Subscription subscription, JSONObject ssOrder, int mode) throws Exception
+	public Boolean hasValidShippingAddress(Invoice invoice, Subscription subscription, JSONObject order, int mode) throws Exception
 	{
+		logger.log(Level.INFO, "\n\tMethod : hasValidShippingAddress");
 		ShippingAddress invShippAdd = invoice.shippingAddress();
 		Subscription.ShippingAddress subShippAdd = subscription.shippingAddress();
 		if (invShippAdd == null && subShippAdd == null)
 		{
-			ssOrder.put("shipTo", ssOrder.getJSONObject("billTo"));
+			order.put("shipTo", order.getJSONObject("billTo"));
 			return true;
 		}
 		JSONObject object = new JSONObject();
-		if(invShippAdd != null && subShippAdd != null && !isInitialFetch(mode) && hasValidInvShippAdd(invShippAdd) && hasValidSubShippAdd(subShippAdd))
+		if(invShippAdd != null && subShippAdd != null && hasValidInvShippAdd(invShippAdd) && hasValidSubShippAdd(subShippAdd))
 		{
 			if(isSameAddress(invShippAdd, subShippAdd))
 			{
+				logger.log(Level.INFO, "\n\tFilling Shipping address for invoice :: " + invoice.id());
 				fillInvShippAdd(invShippAdd, object);
 			}
 			else
 			{
+				logger.log(Level.INFO, "\n\tFilling Shipping address for invoice :: " + invoice.id());
 				fillSubShippAdd(subShippAdd, object);
 			}
 			
 		}
 		else if(invShippAdd != null && hasValidInvShippAdd(invShippAdd))
 		{
+			logger.log(Level.INFO, "\n\tFilling Shipping address for invoice :: " + invoice.id());
 			fillInvShippAdd(invShippAdd, object);
 		}
 		else if(subShippAdd != null && hasValidSubShippAdd(subShippAdd))
 		{	
+			logger.log(Level.INFO, "\n\tFilling Shipping address for invoice :: " + invoice.id());
 			fillSubShippAdd(subShippAdd, object);
 		}
 		else
 		{
-			ssOrder.put("shipTo", ssOrder.getJSONObject("billTo"));
+			logger.log(Level.INFO, "\n\tFilling Shipping address for invoice :: " + invoice.id());
+			logger.log(Level.INFO, "\n\tFilling Billing Address as Shipping Address");
+			order.put("shipTo", order.getJSONObject("billTo"));
 			return true;
 		}
-		ssOrder.put("shipTo", object);
+		order.put("shipTo", object);
 		return true;
 	}
 
@@ -1265,7 +1270,7 @@ public class CBSSIntegration
 
 	private void fillCustomerInfo(Invoice invoice, Customer customer, JSONObject order) throws Exception
 	{
-		logger.log(Level.INFO, "\n\tfilling Customer Info of invoice-id: " + invoice.id());
+		logger.log(Level.INFO, "\n\tFilling Customer Info For Invoice: " + invoice.id());
 		order.put("customerUsername", name(customer));
 		order.put("customerEmail", customer.email() == null ? "" : customer.email());
 	}
@@ -1295,7 +1300,7 @@ public class CBSSIntegration
 		return ordNoVsOrdkey.getString(orderNo);
 	}
 
-	private void fillOrders(int i, Invoice invoice, JSONObject ssOrder, Date orderDate,
+	private void fillOrders(int i, Invoice invoice, JSONObject order, Date orderDate,
 			JSONObject orderVsInvoice, int mode, int billingPeriod) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tOrderDate : " + getSSTimeZone(orderDate));
@@ -1309,18 +1314,18 @@ public class CBSSIntegration
 		JSONArray lineItems = new JSONArray();
 		String cbCurrCode = invoice.currencyCode();
 
-		if (isSync(mode) && cbInvIdVsSSOrdNo.has(invoiceId))
+		if (cbInvIdVsSSOrdNo.has(invoiceId))
 		{
-			orderNo = (String) cbInvIdVsSSOrdNo.getJSONArray(invoiceId).get(i);
+			orderNo = cbInvIdVsSSOrdNo.getJSONArray(invoiceId).getString(i);
 			orderKey = getSSOrderKey(orderNo);
-			ssOrder.put("orderKey", orderKey);
+			order.put("orderKey", orderKey);
 		}
 		orderVsInvoice.put(orderNo, invoiceId);
-		ssOrder.put("orderNumber", orderNo);
-		ssOrder.put("orderDate", getSSTimeZone(orderDate));
-		ssOrder.put("paymentDate", getSSTimeZone(invoice.paidAt()));
-		ssOrder.put("orderStatus", getOrderStatus(invoice.status().toString()));
-		ssOrder.put("amountPaid", (getSSCurrency(invoice.amountPaid(), cbCurrCode)));
+		order.put("orderNumber", orderNo);
+		order.put("orderDate", getSSTimeZone(orderDate));
+		order.put("paymentDate", getSSTimeZone(invoice.paidAt()));
+		order.put("orderStatus", getOrderStatus(invoice.status()));
+		order.put("amountPaid", (getSSCurrency(invoice.amountPaid(), cbCurrCode)));
 		logger.log(Level.INFO, "\n\tamountPaid after conversion : "
 				+ getSSCurrency(invoice.amountPaid(), cbCurrCode));
 		logger.log(Level.INFO, "\n\tdiscount : " + invoice.discounts());
@@ -1352,7 +1357,7 @@ public class CBSSIntegration
 			 disc+= discount.amount();
 		}
 		logger.log(Level.INFO, "\n\tdiscountAmount after conversion : " + getSSCurrency(disc, cbCurrCode));
-		ssOrder.put("items", lineItems);
+		order.put("items", lineItems);
 
 	}
 
@@ -1376,103 +1381,116 @@ public class CBSSIntegration
 				.post(payload);
 	}
 
-	private void createCBOrders(JSONObject ordersFromCBInvoices, int mode) throws Exception
+	private void createCBOrders(JSONArray ordersOfCBInvoices, int mode) throws Exception
 	{
 		logger.log(Level.INFO, "\n\tgetting shipstation orders");
 		Client client = ClientBuilder.newClient();
-		String orderStatus = "";
-		String customerNote = "";
-		String trackingId = "";
-		String batchId = "";
-		String orderNo;
-		String orderKey;
+		String orderStatus = null;
+		String customerNote = null;
+		String trackingId = null;
+		String batchId = null;
+		int currPage = 0;
+		int totalPages = 1;
+		String ssOrdNo;
+		String ssOrderKey;
 		String invoiceId;
 		String ssOrdId;
 		StringBuilder url;
+		int nextPage;
+		url = new StringBuilder(CBSSIConstants.ordersUrl);
 		JSONObject ssOrdNoVsSSOrdKey = thirdPartyMapping
 				.getJSONObject(CBSSIConstants.SSOrdNoVsSSOrderKey);
 		JSONObject ssOrdKeyVsCBInvId = thirdPartyMapping
 				.getJSONObject(CBSSIConstants.SSOrdKeyVsCBInvId);
-		if (!isInitialFetch(mode))
+		if (!isInitialFetch(mode) & getSSLastSyncTime() != null)
 		{
-			Date lastSync = new Date(getSSLastSyncTime());
-			url = new StringBuilder(CBSSIConstants.listOrdersAfter).append(getSSTimeZone(lastSync));
+			Date lastSyncTime = new Date(getSSLastSyncTime());
+			url.append("&modifyDateStart=" + getSSTimeZone(lastSyncTime));
 		}
-		url = new StringBuilder(CBSSIConstants.ordersUrl);
-		url.append("?orderStatus=awaiting_shipment");
-		logger.log(Level.INFO, "\n\tlist orders in shipstation :: " + url.toString());
-		Response response = client.target(url.toString()).request(MediaType.TEXT_PLAIN_TYPE)
-				.header("Authorization", ssApiKey).get();
-		int status = response.getStatus();
-		String messege = response.getStatusInfo().getReasonPhrase();
-		if (response.getStatus() == HttpStatus.SC_OK)
+		logger.log(Level.INFO, "\n\tssOrders URL : " + url.toString());
+		url.append("&page=");
+		
+		while(currPage < totalPages)
 		{
-			JSONObject ssOrders = new JSONObject(response.readEntity(String.class));
-			JSONArray orders = ssOrders.getJSONArray("orders");
-			logger.log(Level.INFO, "\n\tssOrders : " + orders.toString());
-			JSONObject orderShipInfo;
-
-			for (int i = 0; i < orders.length(); i++)
+			nextPage = currPage + 1;
+			Response response = client.target(url.toString() + nextPage).request(MediaType.TEXT_PLAIN_TYPE)
+					.header("Authorization", ssApiKey).get();
+			int status = response.getStatus();
+			String messege = response.getStatusInfo().getReasonPhrase();
+			if (response.getStatus() == HttpStatus.SC_OK)
 			{
-				JSONObject order = orders.getJSONObject(i);
-				orderNo = order.getString(CBSSIConstants.orderNumber);
-				orderKey = ssOrdNoVsSSOrdKey.getString(orderNo);
-				invoiceId = ssOrdKeyVsCBInvId.getString(orderKey);
-				if (isOrderFromCB(order, ordersFromCBInvoices))
+				JSONObject object = new JSONObject(response.readEntity(String.class));
+				totalPages = object.getInt("pages");
+				currPage = object.getInt("page");
+				JSONArray ssOrders = object.getJSONArray("orders");
+				JSONObject orderShipInfo;
+				logger.log(Level.INFO, "\n\tssOrders : " + object);
+				logger.log(Level.INFO, "\n\tssOrders URL : " + url.toString() + currPage);
+				logger.log(Level.INFO, "\n\theaders : " + response.getHeaders());
+				for (int i = 0; i < ssOrders.length(); i++)
 				{
-					ssOrdId = order.getString("orderId");
-					orderShipInfo = getShipmentInfo(orderNo);
-					orderStatus = order.getString("orderStatus");
-					if (order.has("customerNote"))
+					JSONObject ssOrder = ssOrders.getJSONObject(i);
+					
+					if (isOrderFromCB(ssOrder, ordersOfCBInvoices))
 					{
-						customerNote = order.getString("customerNote");
+						ssOrdId = ssOrder.getString("orderId");
+						ssOrdNo = ssOrder.getString(CBSSIConstants.orderNumber);
+						ssOrderKey = ssOrdNoVsSSOrdKey.getString(ssOrdNo);
+						invoiceId = ssOrdKeyVsCBInvId.getString(ssOrderKey);
+						orderShipInfo = getShipmentInfo(ssOrdNo);
+						
+						if (ssOrder.has("orderStatus"))
+						{
+							orderStatus = ssOrder.getString("orderStatus");
+						}
+						if (ssOrder.has("customerNote"))
+						{
+							customerNote = ssOrder.getString("customerNote");
+						}
+						if (ssOrder.has("trackingNumber"))
+						{
+							trackingId = orderShipInfo.getString("trackingNumber");
+						}
+						if (ssOrder.has("batchNumber"))
+						{
+							batchId = orderShipInfo.getString("batchNumber");
+						}
+						create(invoiceId, ssOrdId, orderStatus, batchId, trackingId, customerNote);
 					}
-					if (order.has("trackingNumber"))
-					{
-						trackingId = orderShipInfo.getString("trackingNumber");
-					}
-					if (order.has("batchNumber"))
-					{
-						batchId = orderShipInfo.getString("batchNumber");
-					}
-					create(invoiceId, ssOrdId, orderStatus, batchId, trackingId, customerNote);
 				}
 			}
-		}
-		else if ((status == 429))
-		{
-			logger.log(Level.INFO, "\n\t" + status + " : " + messege + "( Rate Limit Exceeded)");
-			Thread.sleep(60000);
-			createCBOrders(ordersFromCBInvoices, mode);
-		}
-		else if ((status == HttpStatus.SC_UNAUTHORIZED) || (status == HttpStatus.SC_BAD_REQUEST)
-				|| (status == HttpStatus.SC_FORBIDDEN) || (status == HttpStatus.SC_NOT_FOUND)
-				|| status == HttpStatus.SC_INTERNAL_SERVER_ERROR)
-		{
-			logger.log(Level.INFO, "\n\t" + status + " : " + messege
-					+ "(Wrong user credentials, NO user permissions to this api, Invalid api resource, Internal Error)");
-			throw new RuntimeException(messege);
+			else if ((status == 429))
+			{
+				logger.log(Level.INFO, "\n\t" + status + " : " + messege + "( Rate Limit Exceeded)");
+				Thread.sleep(60000);
+				createCBOrders(ordersOfCBInvoices, mode);
+			}
+			else if ((status == HttpStatus.SC_UNAUTHORIZED) || (status == HttpStatus.SC_BAD_REQUEST)
+					|| (status == HttpStatus.SC_FORBIDDEN) || (status == HttpStatus.SC_NOT_FOUND)
+					|| status == HttpStatus.SC_INTERNAL_SERVER_ERROR)
+			{
+				logger.log(Level.INFO, "\n\t" + status + " : " + messege
+						+ "( Internal Error or Invalid user credentials or Has no user permissions to this api or Invalid api resource)");
+				throw new RuntimeException(messege);
+			}
 		}
 	}
 
-	private boolean isOrderFromCB(JSONObject order, JSONObject ordersFromCBInvoices)
+	private boolean isOrderFromCB(JSONObject ssOrder, JSONArray ssOrdersOfCBInvoices)
 			throws JSONException, IOException
 	{
-		logger.log(Level.INFO, "\n\tSplitting Shipstation Orders");
-		String orderId = order.getString("orderId");
-		JSONArray ordersFromCB = ordersFromCBInvoices.getJSONArray("results");
+		logger.log(Level.INFO, "\n\tMethod : isOrderFromCB");
 		JSONObject ssOrdVsCBOrd = thirdPartyMapping.getJSONObject(CBSSIConstants.SSOrdVsCBOrd);
-		JSONObject ordFromCB;
-		for (int i = 0; i < ordersFromCB.length(); i++)
+		String ssOrderId = ssOrder.getString("orderId");
+		JSONObject ssOrdOfCBInv;
+		for (int i = 0; i < ssOrdersOfCBInvoices.length(); i++)
 		{
-			ordFromCB = ordersFromCB.getJSONObject(i);
-			if (orderId.equals(ordFromCB.getString("orderId")))// ordFromCB contains current sync
-																// response
+			ssOrdOfCBInv = ssOrdersOfCBInvoices.getJSONObject(i);
+			if (ssOrderId.equals(ssOrdOfCBInv.getString("orderId")))// ordFromCB contains current sync response
 			{
 				return true;
 			}
-			else if (ssOrdVsCBOrd.has(orderId))// ssOrdVsCBOrd contains old orders too that may be
-												// updated in SS
+			else if (ssOrdVsCBOrd.has(ssOrderId))// ssOrdVsCBOrd contains old orders too that may be updated in SS								
 			{
 				return true;
 			}
@@ -1491,32 +1509,31 @@ public class CBSSIntegration
 	private void create(String invoiceId, String ssOrdId, String orderStatus, String batchId,
 			String trackingId, String customerNote) throws Exception
 	{
-		logger.log(Level.INFO, "\n\tCreating ChargeBee orders");
+		logger.log(Level.INFO, "\n\tUpdating ChargeBee orders");
 		Order order;
 		Result result;
 		String cbOrdId = getCBOrdId(ssOrdId);
 		if (cbOrdId == null) // new order
 		{
-
+			logger.log(Level.INFO, "\n\tStatus : " + orderStatus);
 			result = Order.create().id(ssOrdId).invoiceId(invoiceId).status(CBSSIConstants.cbOrdStatusForSSOrdStatus.get(orderStatus)).fulfillmentStatus(orderStatus)
 					.referenceId(ssOrdId).batchId(batchId).note(customerNote).request();
 			order = result.order();
 			updSSOrderVsCBOrder(ssOrdId, order.id());
-			logger.log(Level.INFO, "\n\tCreated Chargebee Order : " + order);
+			logger.log(Level.INFO, "\n\tChargebee Order Created");
 		}
 		else
 		{
-			logger.log(Level.INFO, "\n\tUpdating ChargeBee orders");
 			result = Order.update(getCBOrdId(ssOrdId)).fulfillmentStatus(orderStatus)
 					.referenceId(ssOrdId).batchId(batchId).note(customerNote).request();
 			order = result.order();
-			logger.log(Level.INFO, "\n\tUpdated Chargebee Order : " + order);
+			logger.log(Level.INFO, "\n\tChargebee Order Updated");
 		}
 	}
 
 	private String getCBOrdId(String ssOrdId) throws Exception
 	{
-		logger.log(Level.INFO, "\n\tgetting the ChargeBee orderId for Update");
+		logger.log(Level.INFO, "\n\tMethod : getCBOrdId");
 		JSONObject ssOrdVsCBOrd = thirdPartyMapping.getJSONObject(CBSSIConstants.SSOrdVsCBOrd);
 		if (ssOrdVsCBOrd.has(ssOrdId))
 		{
@@ -1535,8 +1552,8 @@ public class CBSSIntegration
 			return;
 		}
 		ssOrdVsCBOrd.put(ssOrderId, cbOrderId);
-		thirdPartyMapping.put(CBSSIConstants.SSOrdVsCBOrd, ssOrdVsCBOrd);
 		cbOrdVsSSOrd.put(cbOrderId, ssOrderId);
+		thirdPartyMapping.put(CBSSIConstants.SSOrdVsCBOrd, ssOrdVsCBOrd);
 		thirdPartyMapping.put(CBSSIConstants.CBOrdVsSSOrd, cbOrdVsSSOrd);
 		// updThirdPartyMapping("SSOrdVsCBOrd updated");
 	}
@@ -1613,11 +1630,11 @@ public class CBSSIntegration
 		return mode == CBSSIConstants.FAILED_INV_PROCESS;
 	}
 
-	private String getOrderStatus(String invoiceStatus) throws IOException
+	private String getOrderStatus(Invoice.Status status) throws IOException
 	{
 		logger.log(Level.INFO, "\n\tMethod : getOrderStatus");
 		
-		return CBSSIConstants.ssOrdStatusOfCBInvStatus.get(invoiceStatus);
+		return CBSSIConstants.ssOrdStatusOfCBInvStatus.get(status);
 	}
 
 }
